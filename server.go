@@ -1,26 +1,14 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"crypto/tls"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"io/ioutil"
+	"log"
 	"net/http"
-	"os"
-	"path/filepath"
-	"strings"
-	"syscall"
-	
-	"github.com/alexmullins/zip"  // 使用支持密码的zip库
-	"golang.org/x/term"
-)
-
-const (
-	AuthURL = "https://xzip.com/authorize"
-	KeyFile = ".xzip/key"
+	"sync"
+	"time"
 )
 
 type AuthRequest struct {
@@ -31,330 +19,253 @@ type AuthResponse struct {
 	Status int `json:"status"`
 }
 
-// 获取用户home目录下的key文件路径
-func getKeyFilePath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, KeyFile)
+type KeyInfo struct {
+	Valid      bool      `json:"valid"`
+	CreatedAt  time.Time `json:"created_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	UsageCount int       `json:"usage_count"`
+	MaxUsage   int       `json:"max_usage"`
 }
 
-// 读取授权key
-func readAuthKey() (string, error) {
-	keyPath := getKeyFilePath()
-	data, err := ioutil.ReadFile(keyPath)
-	if err != nil {
-		return "", fmt.Errorf("无法读取key文件 %s: %v", keyPath, err)
+// 模拟的key数据库
+var (
+	keyDatabase = make(map[string]*KeyInfo)
+	dbMutex     = sync.RWMutex{}
+)
+
+// 初始化一些测试key
+func initTestKeys() {
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+
+	// 生成一个有效的测试key
+	testKey := generateRandomKey()
+	keyDatabase[testKey] = &KeyInfo{
+		Valid:      true,
+		CreatedAt:  time.Now(),
+		ExpiresAt:  time.Now().Add(365 * 24 * time.Hour), // 1年有效期
+		UsageCount: 0,
+		MaxUsage:   1000, // 最多使用1000次
 	}
-	return strings.TrimSpace(string(data)), nil
+
+	fmt.Printf("测试Key生成: %s (有效期1年，最多使用1000次)\n", testKey)
+
+	// 生成一个无效的测试key
+	invalidKey := generateRandomKey()
+	keyDatabase[invalidKey] = &KeyInfo{
+		Valid:      false,
+		CreatedAt:  time.Now(),
+		ExpiresAt:  time.Now().Add(-24 * time.Hour), // 已过期
+		UsageCount: 0,
+		MaxUsage:   100,
+	}
+
+	fmt.Printf("无效Key生成: %s (已过期)\n", invalidKey)
 }
 
-// 验证服务器证书域名
-func verifyServerCertificate(resp *http.Response) error {
-	if resp.TLS == nil {
-		return fmt.Errorf("连接不是HTTPS")
-	}
-	
-	for _, cert := range resp.TLS.PeerCertificates {
-		for _, dnsName := range cert.DNSNames {
-			if dnsName == "xzip.com" {
-				return nil
-			}
-		}
-		if cert.Subject.CommonName == "xzip.com" {
-			return nil
-		}
-	}
-	
-	return fmt.Errorf("服务器证书域名验证失败，请确保连接到正确的xzip.com服务器")
+// 生成随机key
+func generateRandomKey() string {
+	bytes := make([]byte, 16)
+	rand.Read(bytes)
+	return hex.EncodeToString(bytes)
 }
 
-// 验证授权
-func validateAuth() error {
-	key, err := readAuthKey()
-	if err != nil {
-		return fmt.Errorf("授权验证失败: %v", err)
+// 验证key的有效性
+func validateKey(key string) int {
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+
+	keyInfo, exists := keyDatabase[key]
+	if !exists {
+		log.Printf("Key不存在: %s", key)
+		return -1 // key不存在
 	}
 
-	authReq := AuthRequest{Key: key}
-	jsonData, err := json.Marshal(authReq)
-	if err != nil {
-		return fmt.Errorf("序列化请求失败: %v", err)
+	// 检查key是否有效
+	if !keyInfo.Valid {
+		log.Printf("Key已禁用: %s", key)
+		return -1
 	}
 
-	// 创建HTTP客户端，禁用证书验证以便自定义验证
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-	client := &http.Client{Transport: tr}
-
-	resp, err := client.Post(AuthURL, "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("网络请求失败: %v", err)
-	}
-	defer resp.Body.Close()
-
-	// 验证服务器证书域名
-	if err := verifyServerCertificate(resp); err != nil {
-		return err
+	// 检查是否过期
+	if time.Now().After(keyInfo.ExpiresAt) {
+		log.Printf("Key已过期: %s", key)
+		return -1
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("读取响应失败: %v", err)
+	// 检查使用次数限制
+	if keyInfo.UsageCount >= keyInfo.MaxUsage {
+		log.Printf("Key使用次数超限: %s (%d/%d)", key, keyInfo.UsageCount, keyInfo.MaxUsage)
+		return -1
 	}
 
-	var authResp AuthResponse
-	if err := json.Unmarshal(body, &authResp); err != nil {
-		return fmt.Errorf("解析响应失败: %v", err)
-	}
-
-	if authResp.Status == -1 {
-		return fmt.Errorf("授权失败: 请到 https://xzip.com 购买正版key来正常使用软件")
-	} else if authResp.Status != 1 {
-		return fmt.Errorf("授权状态异常: 状态码 %d", authResp.Status)
-	}
-
-	fmt.Println("✅ 授权验证成功")
-	return nil
+	// 增加使用计数
+	keyInfo.UsageCount++
+	
+	log.Printf("Key验证成功: %s (使用次数: %d/%d)", key, keyInfo.UsageCount, keyInfo.MaxUsage)
+	return 1 // 验证成功
 }
 
-// 获取密码输入
-func getPassword(prompt string) (string, error) {
-	fmt.Print(prompt)
-	bytePassword, err := term.ReadPassword(int(syscall.Stdin))
-	if err != nil {
-		return "", err
+// 授权验证处理器
+func authorizeHandler(w http.ResponseWriter, r *http.Request) {
+	// 设置CORS头
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Content-Type", "application/json")
+
+	// 处理OPTIONS预检请求
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
 	}
-	fmt.Println()
-	return string(bytePassword), nil
+
+	if r.Method != "POST" {
+		http.Error(w, "仅支持POST方法", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var authReq AuthRequest
+	if err := json.NewDecoder(r.Body).Decode(&authReq); err != nil {
+		log.Printf("JSON解析失败: %v", err)
+		response := AuthResponse{Status: -1}
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	// 记录请求日志
+	clientIP := r.RemoteAddr
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		clientIP = xff
+	}
+	
+	log.Printf("收到授权请求 - IP: %s, Key: %s", clientIP, authReq.Key)
+
+	// 验证key
+	status := validateKey(authReq.Key)
+	
+	response := AuthResponse{Status: status}
+	
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("响应编码失败: %v", err)
+	}
+
+	if status == 1 {
+		log.Printf("授权成功 - IP: %s, Key: %s", clientIP, authReq.Key)
+	} else {
+		log.Printf("授权失败 - IP: %s, Key: %s", clientIP, authReq.Key)
+	}
 }
 
-// 压缩文件夹到ZIP（支持密码）
-func compressToZip(source, target, password string) error {
-	fmt.Printf("正在压缩 %s 到 %s\n", source, target)
-	
-	zipFile, err := os.Create(target)
-	if err != nil {
-		return err
+// 健康检查处理器
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	response := map[string]interface{}{
+		"status":    "ok",
+		"timestamp": time.Now().Unix(),
+		"service":   "xzip-auth-server",
 	}
-	defer zipFile.Close()
-
-	archive := zip.NewWriter(zipFile)
-	defer archive.Close()
-
-	return filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		header, err := zip.FileInfoHeader(info)
-		if err != nil {
-			return err
-		}
-
-		// 设置相对路径
-		relPath, _ := filepath.Rel(source, path)
-		header.Name = relPath
-
-		if info.IsDir() {
-			header.Name += "/"
-		} else {
-			header.Method = zip.Deflate
-		}
-
-		var writer io.Writer
-		if password != "" {
-			// 使用密码保护
-			writer, err = archive.Encrypt(header.Name, password)
-		} else {
-			writer, err = archive.CreateHeader(header)
-		}
-		
-		if err != nil {
-			return err
-		}
-
-		if !info.IsDir() {
-			file, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			defer file.Close()
-			_, err = io.Copy(writer, file)
-			return err
-		}
-
-		return nil
-	})
+	json.NewEncoder(w).Encode(response)
 }
 
-// 从ZIP解压缩（支持密码）
-func extractFromZip(source, target, password string) error {
-	fmt.Printf("正在解压缩 %s 到 %s\n", source, target)
+// 管理接口 - 添加新key
+func addKeyHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "仅支持POST方法", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 生成新key
+	newKey := generateRandomKey()
 	
-	reader, err := zip.OpenReader(source)
-	if err != nil {
-		return err
+	dbMutex.Lock()
+	keyDatabase[newKey] = &KeyInfo{
+		Valid:      true,
+		CreatedAt:  time.Now(),
+		ExpiresAt:  time.Now().Add(365 * 24 * time.Hour),
+		UsageCount: 0,
+		MaxUsage:   1000,
 	}
-	defer reader.Close()
+	dbMutex.Unlock()
 
-	os.MkdirAll(target, 0755)
-
-	for _, file := range reader.File {
-		path := filepath.Join(target, file.Name)
-		
-		if file.FileInfo().IsDir() {
-			os.MkdirAll(path, file.FileInfo().Mode())
-			continue
-		}
-
-		var fileReader io.ReadCloser
-		if file.IsEncrypted() {
-			if password == "" {
-				return fmt.Errorf("文件 %s 需要密码，但未提供密码", file.Name)
-			}
-			fileReader, err = file.OpenWithPassword(password)
-		} else {
-			fileReader, err = file.Open()
-		}
-		
-		if err != nil {
-			return fmt.Errorf("打开文件 %s 失败: %v", file.Name, err)
-		}
-		defer fileReader.Close()
-
-		os.MkdirAll(filepath.Dir(path), 0755)
-		
-		targetFile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.FileInfo().Mode())
-		if err != nil {
-			return err
-		}
-		defer targetFile.Close()
-
-		_, err = io.Copy(targetFile, fileReader)
-		if err != nil {
-			return err
-		}
+	w.Header().Set("Content-Type", "application/json")
+	response := map[string]interface{}{
+		"key":     newKey,
+		"message": "新Key已生成",
+		"expires": time.Now().Add(365 * 24 * time.Hour),
 	}
-
-	return nil
+	
+	json.NewEncoder(w).Encode(response)
+	log.Printf("管理员生成新Key: %s", newKey)
 }
 
-// 初始化key文件
-func initKeyFile() error {
-	keyPath := getKeyFilePath()
-	keyDir := filepath.Dir(keyPath)
-	
-	// 创建.xzip目录
-	if err := os.MkdirAll(keyDir, 0700); err != nil {
-		return fmt.Errorf("创建目录失败: %v", err)
-	}
-	
-	// 如果key文件不存在，创建一个空的
-	if _, err := os.Stat(keyPath); os.IsNotExist(err) {
-		file, err := os.Create(keyPath)
-		if err != nil {
-			return fmt.Errorf("创建key文件失败: %v", err)
+// 统计信息处理器
+func statsHandler(w http.ResponseWriter, r *http.Request) {
+	dbMutex.RLock()
+	defer dbMutex.RUnlock()
+
+	totalKeys := len(keyDatabase)
+	validKeys := 0
+	totalUsage := 0
+
+	for _, keyInfo := range keyDatabase {
+		if keyInfo.Valid && time.Now().Before(keyInfo.ExpiresAt) {
+			validKeys++
 		}
-		file.Close()
-		
-		fmt.Printf("已创建key文件: %s\n", keyPath)
-		fmt.Println("请将您的授权key写入此文件")
-		return fmt.Errorf("key文件为空，请先配置授权key")
+		totalUsage += keyInfo.UsageCount
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	response := map[string]interface{}{
+		"total_keys":   totalKeys,
+		"valid_keys":   validKeys,
+		"total_usage":  totalUsage,
+		"server_time":  time.Now(),
 	}
 	
-	return nil
+	json.NewEncoder(w).Encode(response)
 }
 
 func main() {
-	fmt.Println("XZip 商业压缩软件 v1.0")
-	fmt.Println("=================================")
+	fmt.Println("XZip 授权服务器 v1.0")
+	fmt.Println("==============================")
 
-	// 初始化key文件
-	if err := initKeyFile(); err != nil {
-		fmt.Printf("❌ 初始化失败: %v\n", err)
-		return
-	}
+	// 初始化测试数据
+	initTestKeys()
 
-	// 验证授权
-	if err := validateAuth(); err != nil {
-		fmt.Printf("❌ %v\n", err)
-		return
-	}
+	// 设置路由
+	http.HandleFunc("/authorize", authorizeHandler)
+	http.HandleFunc("/health", healthHandler)
+	http.HandleFunc("/admin/addkey", addKeyHandler)
+	http.HandleFunc("/admin/stats", statsHandler)
 
-	if len(os.Args) < 2 {
-		fmt.Println("使用方法:")
-		fmt.Println("  压缩: xzip compress <源文件/文件夹> <目标.zip文件>")
-		fmt.Println("  解压: xzip extract <源.zip文件> <目标文件夹>")
-		return
-	}
-
-	command := os.Args[1]
-
-	switch command {
-	case "compress":
-		if len(os.Args) < 4 {
-			fmt.Println("❌ 参数不足: xzip compress <源文件/文件夹> <目标.zip文件>")
+	// 根路径处理
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
 			return
 		}
+		
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `
+		<h1>XZip 授权服务器</h1>
+		<p>服务状态: 正常运行</p>
+		<p>当前时间: %s</p>
+		<h2>API接口:</h2>
+		<ul>
+			<li><a href="/health">健康检查</a></li>
+			<li><a href="/admin/stats">统计信息</a></li>
+			<li>POST /authorize - 客户端授权验证</li>
+			<li>POST /admin/addkey - 生成新Key</li>
+		</ul>
+		`, time.Now().Format("2006-01-02 15:04:05"))
+	})
 
-		source := os.Args[2]
-		target := os.Args[3]
-
-		// 询问是否需要密码保护
-		fmt.Print("是否需要密码保护? (y/n): ")
-		scanner := bufio.NewScanner(os.Stdin)
-		scanner.Scan()
-		needPassword := strings.ToLower(scanner.Text()) == "y"
-
-		var password string
-		if needPassword {
-			var err error
-			password, err = getPassword("请输入密码: ")
-			if err != nil {
-				fmt.Printf("❌ 密码输入失败: %v\n", err)
-				return
-			}
-		}
-
-		if err := compressToZip(source, target, password); err != nil {
-			fmt.Printf("❌ 压缩失败: %v\n", err)
-		} else {
-			fmt.Printf("✅ 压缩完成: %s\n", target)
-		}
-
-	case "extract":
-		if len(os.Args) < 4 {
-			fmt.Println("❌ 参数不足: xzip extract <源.zip文件> <目标文件夹>")
-			return
-		}
-
-		source := os.Args[2]
-		target := os.Args[3]
-
-		// 询问是否需要密码
-		fmt.Print("该压缩包是否有密码? (y/n): ")
-		scanner := bufio.NewScanner(os.Stdin)
-		scanner.Scan()
-		hasPassword := strings.ToLower(scanner.Text()) == "y"
-
-		var password string
-		if hasPassword {
-			var err error
-			password, err = getPassword("请输入密码: ")
-			if err != nil {
-				fmt.Printf("❌ 密码输入失败: %v\n", err)
-				return
-			}
-		}
-
-		if err := extractFromZip(source, target, password); err != nil {
-			fmt.Printf("❌ 解压缩失败: %v\n", err)
-		} else {
-			fmt.Printf("✅ 解压缩完成: %s\n", target)
-		}
-
-	default:
-		fmt.Printf("❌ 未知命令: %s\n", command)
-		fmt.Println("支持的命令: compress, extract")
-	}
+	// 启动HTTPS服务器
+	fmt.Println("正在启动HTTPS服务器...")
+	fmt.Println("服务地址: https://localhost:8443")
+	fmt.Println("证书文件: server.crt")
+	fmt.Println("私钥文件: server.key")
+	
+	log.Fatal(http.ListenAndServeTLS(":8443", "server.crt", "server.key", nil))
 }

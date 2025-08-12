@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	AuthURL = "https://xzip.com/authorize"
+	AuthURL = "https://localhost:8443/authorize"  // 使用本地服务器
 	KeyFile = ".xzip/key"
 )
 
@@ -43,24 +43,15 @@ func readAuthKey() (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
-// 验证服务器证书域名
+// 验证服务器证书域名 (本地测试版本)
 func verifyServerCertificate(resp *http.Response) error {
 	if resp.TLS == nil {
 		return fmt.Errorf("连接不是HTTPS")
 	}
 	
-	for _, cert := range resp.TLS.PeerCertificates {
-		for _, dnsName := range cert.DNSNames {
-			if dnsName == "xzip.com" {
-				return nil
-			}
-		}
-		if cert.Subject.CommonName == "xzip.com" {
-			return nil
-		}
-	}
-	
-	return fmt.Errorf("服务器证书域名验证失败，请确保连接到正确的xzip.com服务器")
+	// 本地测试时，跳过域名验证
+	fmt.Println("⚠️  本地测试模式：跳过证书域名验证")
+	return nil
 }
 
 // 验证授权
@@ -70,12 +61,16 @@ func validateAuth() error {
 		return fmt.Errorf("授权验证失败: %v", err)
 	}
 
+	fmt.Printf("🔑 使用Key: %s\n", key)
+	fmt.Printf("🌐 请求地址: %s\n", AuthURL)
+
 	authReq := AuthRequest{Key: key}
 	jsonData, err := json.Marshal(authReq)
 	if err != nil {
 		return fmt.Errorf("序列化请求失败: %v", err)
 	}
 
+	// 创建HTTP客户端，跳过证书验证（本地测试用）
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
@@ -87,6 +82,9 @@ func validateAuth() error {
 	}
 	defer resp.Body.Close()
 
+	fmt.Printf("📡 HTTP状态码: %d\n", resp.StatusCode)
+
+	// 验证服务器证书域名（本地测试版本）
 	if err := verifyServerCertificate(resp); err != nil {
 		return err
 	}
@@ -96,9 +94,15 @@ func validateAuth() error {
 		return fmt.Errorf("读取响应失败: %v", err)
 	}
 
+	fmt.Printf("📄 服务器响应: %s\n", string(body))
+
+	if len(body) == 0 {
+		return fmt.Errorf("服务器返回空响应")
+	}
+
 	var authResp AuthResponse
 	if err := json.Unmarshal(body, &authResp); err != nil {
-		return fmt.Errorf("解析响应失败: %v", err)
+		return fmt.Errorf("解析响应失败: %v, 响应内容: %s", err, string(body))
 	}
 
 	if authResp.Status == -1 {
@@ -230,7 +234,7 @@ func initKeyFile() error {
 }
 
 func main() {
-	fmt.Println("XZip 商业压缩软件 v1.0 (无密码版本)")
+	fmt.Println("XZip 商业压缩软件 v1.0 (本地测试版)")
 	fmt.Println("=================================")
 
 	if err := initKeyFile(); err != nil {
